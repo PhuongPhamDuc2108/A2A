@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 class SearchAgentExecutor(AgentExecutor):
     """Search Agent Executor."""
 
-    def __init__(self):
-        self.agent = SearchAgent()
+    def __init__(self,agent:SearchAgent):
+        self.agent = agent
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         if self._validate_request(context):

@@ -1,19 +1,17 @@
 import logging
 import os
 import sys
-import httpx
 import click
 import uvicorn
 from dotenv import load_dotenv
 
+# THÊM CÁC IMPORT CẦN THIẾT
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
 from a2a.server.apps import A2AStarletteApplication
 from a2a.server.request_handlers import DefaultRequestHandler
-# SỬA LỖI: Import thêm các thành phần cần thiết cho push notification
-from a2a.server.tasks import (
-    InMemoryTaskStore,
-    InMemoryPushNotificationConfigStore,
-    BasePushNotificationSender,
-)
+from a2a.server.tasks import InMemoryTaskStore
 from a2a.types import AgentCard, AgentCapabilities, AgentSkill
 
 from calculator_agent import CalculatorAgent, GPTOSSChatModel, calculator_tool
@@ -24,9 +22,18 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ĐỊNH NGHĨA AGENT CARD Ở PHẠM VI TOÀN CỤC ĐỂ CÓ THỂ TRUY CẬP
+agent_card: AgentCard = None
 
 class MissingEnvVarError(Exception):
     """Lỗi thiếu biến môi trường."""
+
+# HÀM MỚI ĐỂ PHỤC VỤ AGENT CARD
+async def serve_agent_card(request):
+    """Endpoint để trả về thông tin Agent Card."""
+    if agent_card:
+        return JSONResponse(agent_card.model_dump(mode='json'))
+    return JSONResponse({'error': 'Agent card not initialized'}, status_code=500)
 
 
 @click.command()
@@ -34,13 +41,13 @@ class MissingEnvVarError(Exception):
 @click.option('--port', default=10001, help='Port to run the server on.')
 def main(host, port):
     """Khởi động máy chủ cho Calculator Agent."""
+    global agent_card
     try:
         if not os.getenv('TOOL_LLM_URL'):
             raise MissingEnvVarError('TOOL_LLM_URL environment variable not set.')
         if not os.getenv('TOOL_LLM_NAME'):
             raise MissingEnvVarError('TOOL_LLM_NAME environment variable not set.')
 
-        # SỬA LỖI: Thêm push_notifications=False để rõ ràng hơn
         capabilities = AgentCapabilities(streaming=True, push_notifications=False)
         skill = AgentSkill(
             id='calculator',
@@ -50,6 +57,7 @@ def main(host, port):
             examples=['What is 100 * (5 + 2)?', 'Calculate 9^3'],
         )
 
+        # Gán giá trị cho biến agent_card toàn cục
         agent_card = AgentCard(
             name='Calculator Agent',
             description='An agent that can perform mathematical calculations.',
@@ -68,30 +76,22 @@ def main(host, port):
         tools = [calculator_tool]
         agent = CalculatorAgent(llm=llm, tools=tools)
 
-        # --- SỬA LỖI: BẮT ĐẦU ---
-        # Thêm cấu hình cho Push Notification (ngay cả khi không dùng)
-        push_config_store = InMemoryPushNotificationConfigStore()
-        client = httpx.AsyncClient()
-
-        # 2. Truyền client vào push_sender
-        push_sender = BasePushNotificationSender(
-            config_store=push_config_store, httpx_client=client
-        )
-
         request_handler = DefaultRequestHandler(
             agent_executor=CalculatorAgentExecutor(agent=agent),
             task_store=InMemoryTaskStore(),
-            # Truyền các tham số còn thiếu vào
-            push_config_store=push_config_store,
-            push_sender=push_sender,
         )
-        # --- SỬA LỖI: KẾT THÚC ---
 
         server = A2AStarletteApplication(
             agent_card=agent_card, http_handler=request_handler
         )
 
-        uvicorn.run(server.build(), host=host, port=port)
+        # Lấy ứng dụng starlette và thêm route thủ công
+        app = server.build()
+        app.routes.insert(
+            0, Route("/.well-known/a2a/agent-card", endpoint=serve_agent_card, methods=["GET"])
+        )
+
+        uvicorn.run(app, host=host, port=port)
 
     except MissingEnvVarError as e:
         logger.error(f'Configuration Error: {e}')
@@ -103,4 +103,3 @@ def main(host, port):
 
 if __name__ == '__main__':
     main()
-

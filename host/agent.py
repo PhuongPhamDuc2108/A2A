@@ -17,14 +17,12 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, System
 from langchain_core.prompts import ChatPromptTemplate
 
 from a2a.client import A2AClient
-# THAY ĐỔI: Đã xóa 'ContentType' khỏi dòng import
 from a2a.types import Task, Message, Part, TextPart
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-# Lớp GPTOSSChatModel (giữ nguyên để giao tiếp với LLM của bạn)
 class GPTOSSChatModel(BaseChatModel):
     base_url: str = Field(...)
     model: str = Field(...)
@@ -95,8 +93,7 @@ class HostAgent:
     """
     Host Agent đóng vai trò điều phối, gọi đến các remote agent khác để thực hiện tác vụ.
     """
-    # THAY ĐỔI: Cập nhật cách khai báo content types
-    SUPPORTED_CONTENT_TYPES = [Part(root=TextPart(text=""))]
+    SUPPORTED_CONTENT_TYPES = ['text/plain']
 
     SYSTEM_PROMPT_TEMPLATE = """You are an expert delegator that can delegate the user request to the
 appropriate remote agents.
@@ -117,21 +114,17 @@ Agents:
 {agents_list}
 """
 
-    def __init__(self):
-        # 1. Khám phá các remote agent và lưu thông tin
-        self.remote_agents: List[Dict[str, Any]] = asyncio.run(self._discover_remote_agents())
-        if not self.remote_agents:
+    def __init__(self, remote_agents: List[Dict[str, Any]]):
+        if not remote_agents:
             raise RuntimeError("Could not discover any remote agents. Check URLs in .env")
 
-        # 2. Tạo các tool
+        self.remote_agents = remote_agents
         self.tools = self._create_tools()
 
-        # 3. Tạo system prompt động
         system_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
             agents_list=json.dumps(self.remote_agents, indent=2)
         )
 
-        # 4. Khởi tạo LLM và Agent Executor
         self.llm = GPTOSSChatModel(
             base_url=os.getenv("TOOL_LLM_URL"),
             model=os.getenv("TOOL_LLM_NAME"),
@@ -144,28 +137,38 @@ Agents:
 
         self.agent_executor = create_react_agent(self.llm, self.tools, messages_modifier=prompt)
 
-    async def _discover_remote_agents(self) -> List[Dict[str, Any]]:
+    @classmethod
+    async def create(cls):
+        """
+        Phương thức bất đồng bộ để khám phá agent và khởi tạo một instance của HostAgent.
+        """
+        discovered_agents = await cls._discover_remote_agents()
+        return cls(remote_agents=discovered_agents)
+
+    @staticmethod
+    async def _discover_remote_agents() -> List[Dict[str, Any]]:
         """
         Đọc AgentCard từ các URL trong .env và trả về danh sách thông tin agent.
         """
         agent_urls = [url.strip() for url in os.getenv("REMOTE_AGENT_URLS", "").split(",") if url.strip()]
+
+        # SỬA LỖI: Không cần tạo httpx.AsyncClient ở đây nữa
+        # SDK sẽ tự xử lý
+        tasks = [A2AClient(url).get_agent_card() for url in agent_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
         discovered_agents = []
-        async with httpx.AsyncClient() as client:
-            tasks = [A2AClient(base_url=url, client=client).get_agent_card() for url in agent_urls]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        for agent_card in results:
+            if isinstance(agent_card, Exception):
+                logger.error(f"Failed to fetch agent card: {agent_card}")
+                continue
 
-            for agent_card in results:
-                if isinstance(agent_card, Exception):
-                    logger.error(f"Failed to fetch agent card: {agent_card}")
-                    continue
-
-                # Lưu thông tin cần thiết để LLM có thể quyết định
-                discovered_agents.append({
-                    "name": agent_card.name.replace(" ", "_"),
-                    "url": agent_card.url,
-                    "description": agent_card.description,
-                    "skills": [s.description for s in agent_card.skills],
-                })
+            discovered_agents.append({
+                "name": agent_card.name.replace(" ", "_"),
+                "url": agent_card.url,
+                "description": agent_card.description,
+                "skills": [s.description for s in agent_card.skills],
+            })
         logger.info(f"Discovered {len(discovered_agents)} remote agents.")
         return discovered_agents
 
@@ -183,16 +186,16 @@ Agents:
                 return f"Error: Agent '{agent_name}' not found. Use 'list_remote_agents' to see available agents."
 
             try:
-                async with httpx.AsyncClient() as client:
-                    a2a_client = A2AClient(base_url=agent_info['url'], client=client)
-                    message = Message(role='user', content=[Part(root=TextPart(text=query))])
-                    task_result = await a2a_client.execute(message=message, stream=False)
+                # SỬA LỖI: A2AClient tự quản lý client
+                a2a_client = A2AClient(agent_info['url'])
+                message = Message(role='user', content=[Part(root=TextPart(text=query))])
+                task_result = await a2a_client.execute(message=message, stream=False)
 
-                    if task_result and isinstance(task_result, Task) and task_result.artifacts:
-                        text_part = task_result.artifacts[-1].parts[0].root
-                        if isinstance(text_part, TextPart):
-                            return text_part.text
-                    return "Agent did not return a valid text response."
+                if task_result and isinstance(task_result, Task) and task_result.artifacts:
+                    text_part = task_result.artifacts[-1].parts[0].root
+                    if isinstance(text_part, TextPart):
+                        return text_part.text
+                return "Agent did not return a valid text response."
             except Exception as e:
                 logger.error(f"Error calling agent '{agent_name}': {e}")
                 return f"An error occurred while communicating with the agent: {e}"
@@ -232,17 +235,16 @@ Agents:
                 tool_name = tool_call['name']
                 tool_args = tool_call['args']
                 if tool_name == 'send_message_to_agent':
-                    content = f"Contacting agent `{tool_args['agent_name']}` with query: `{tool_args['query']}`"
+                    content = f"Contacting agent `{tool_args['agent_name']}` with query: `{tool_args['query']}`\n"
                 else:
-                    content = f"Using tool `{tool_name}`..."
+                    content = f"Using tool `{tool_name}`...\n"
                 yield {'is_task_complete': False, 'content': content}
 
             elif isinstance(last_message, ToolMessage):
-                yield {'is_task_complete': False, 'content': f"Received result from tool `{last_message.name}`."}
+                yield {'is_task_complete': False, 'content': f"Received result from tool `{last_message.name}`.\n"}
 
             elif isinstance(last_message, AIMessage) and not last_message.tool_calls:
                 final_answer = last_message.content
                 break
 
         yield {'is_task_complete': True, 'content': final_answer}
-

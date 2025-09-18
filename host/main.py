@@ -4,9 +4,9 @@ import asyncio
 import os
 import json
 from dotenv import load_dotenv
+import traceback
 
 # Tải các biến môi trường và import HostAgent
-# Đảm bảo tệp này được đặt trong cùng thư mục gốc với thư mục 'app'
 load_dotenv()
 from agent import HostAgent
 
@@ -49,51 +49,53 @@ agent_manager = AgentManager()
 # --- Các hàm xử lý sự kiện cho Gradio ---
 
 async def add_agent_ui(url: str):
-    """
-    Hàm được gọi khi người dùng nhấn nút 'Thêm Agent'.
-    Nó sẽ lấy AgentCard và cập nhật danh sách agent.
-    """
     if not url:
         return agent_manager.remote_agent_urls, gr.update(value="URL không được để trống.")
-
     card_data = await agent_manager.fetch_agent_card(url)
     if "error" in card_data:
         return list(agent_manager.remote_agent_urls), json.dumps(card_data, indent=2)
-
     updated_list = agent_manager.add_agent(url)
     return updated_list, json.dumps(card_data, indent=2)
 
 
-async def chat_function(message: str, history: list):
+async def user_ask(user_message: str, history: list):
     """
-    Hàm chính xử lý việc chat.
-    Nó sẽ khởi tạo HostAgent với danh sách agent hiện tại và stream phản hồi.
+    Cập nhật UI ngay khi người dùng gửi tin nhắn.
     """
+    return "", history + [[user_message, None]]
+
+
+async def bot_respond(history: list):
+    """
+    Lấy câu trả lời từ HostAgent và stream vào giao diện.
+    """
+    user_message = history[-1][0]
+
     if not agent_manager.get_agents_as_str():
-        yield "Vui lòng thêm ít nhất một remote agent trong tab 'Quản lý Agents' trước khi bắt đầu chat."
+        history[-1][1] = "Vui lòng thêm ít nhất một remote agent trong tab 'Quản lý Agents' trước khi bắt đầu chat."
+        yield history
         return
 
-    # Cập nhật biến môi trường tạm thời cho HostAgent sử dụng
     os.environ["REMOTE_AGENT_URLS"] = agent_manager.get_agents_as_str()
 
     try:
-        # Khởi tạo HostAgent với danh sách agent mới nhất
-        host_agent = HostAgent()
+        # SỬA LỖI: Khởi tạo HostAgent bằng phương thức `create` bất đồng bộ
+        host_agent = await HostAgent.create()
 
-        history.append([message, ""])
         full_response = ""
+        history[-1][1] = ""
 
-        # Stream phản hồi từ HostAgent
-        async for chunk in host_agent.stream(message, "gradio-session"):
-            # Nối các phần phản hồi vào chuỗi đầy đủ
+        # Bắt đầu stream phản hồi
+        async for chunk in host_agent.stream(user_message, "gradio-session"):
             content_part = chunk.get('content', '')
-            full_response += content_part + "\n"
-            # Cập nhật chatbot UI với phản hồi đang được stream
+            full_response += content_part
             history[-1][1] = full_response
             yield history
 
     except Exception as e:
-        history.append([message, f"Đã xảy ra lỗi: {e}"])
+        error_message = f"Đã xảy ra lỗi: {e}\n"
+        error_message += traceback.format_exc() # In ra traceback để dễ debug
+        history[-1][1] = error_message
         yield history
 
 
@@ -104,16 +106,33 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Host Agent UI") as demo:
 
     with gr.Tabs():
         with gr.TabItem("Chat"):
-            chatbot = gr.Chatbot(label="Conversation", height=600)
-            msg_textbox = gr.Textbox(placeholder="Hỏi Host Agent điều gì đó...", label="Your Message", lines=2)
-            msg_textbox.submit(chat_function, [msg_textbox, chatbot], chatbot)
-            msg_textbox.submit(lambda: "", None, msg_textbox)
+            chatbot = gr.Chatbot(
+                label="Conversation",
+                height=600,
+                bubble_full_width=False
+            )
+            msg_textbox = gr.Textbox(
+                placeholder="Hỏi Host Agent điều gì đó và nhấn Enter...",
+                label="Your Message",
+                lines=2,
+                scale=7
+            )
+
+            # Luồng sự kiện submit đã được tối ưu
+            msg_textbox.submit(
+                user_ask,
+                [msg_textbox, chatbot],
+                [msg_textbox, chatbot],
+                queue=False,
+            ).then(
+                bot_respond, chatbot, chatbot
+            )
 
         with gr.TabItem("Quản lý Agents"):
             gr.Markdown("## Thêm và xem các Remote Agent")
             with gr.Row():
-                agent_url_input = gr.Textbox(label="URL của Remote Agent", placeholder="http://localhost:10001")
-                add_agent_btn = gr.Button("Thêm Agent")
+                agent_url_input = gr.Textbox(label="URL của Remote Agent", placeholder="http://localhost:10001", scale=4)
+                add_agent_btn = gr.Button("Thêm Agent", scale=1)
 
             gr.Markdown("### Danh sách Agent đã thêm")
             agent_list_display = gr.JSON(label="Agent URLs")
@@ -128,5 +147,4 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Host Agent UI") as demo:
             )
 
 if __name__ == "__main__":
-    # Chạy giao diện web Gradio
     demo.launch(server_name="0.0.0.0", server_port=7860)

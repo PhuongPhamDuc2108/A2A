@@ -8,3 +8,4 @@ click
 httpx
 pydantic
 gradio
+tavily-python
