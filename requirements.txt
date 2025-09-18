@@ -1,0 +1,10 @@
+requests
+langgraph
+langchain-core
+a2a-sdk
+uvicorn
+python-dotenv
+click
+httpx
+pydantic
+gradio
